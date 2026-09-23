@@ -11,3 +11,15 @@ Notes:
 
 Operational guidance:
 - Keep this flag off in production until mainnet payment submission has been reviewed and approved for general availability; flip it on per-environment via env/secret config.
+
+## Invisible Wallet Orchestration
+
+This flag also gates the invisible-wallet orchestration money path. When the flag is off, orchestration entrypoints that would submit a mainnet spend (fee-bump submit, sponsored create, recovery submit) fail closed with HTTP 403 and the stable error code `MAINNET_PAYMENT_SUBMIT_DISABLED`; no wallet key material is decrypted and no Horizon/RPC call is made. Testnet orchestration is unaffected.
+
+- Behavior and request/response contracts for orchestration are documented in `docs/WALLET-API.md`; this flag is the kill-switch for the mainnet-affecting subset of those flows.
+- Authz for orchestration entrypoints is deny-by-default: owner/delegate/guardian/API-key/JWT must be present and valid, and revoked delegates are rejected before any spend is attempted.
+- Replayed or concurrent orchestration requests are idempotent via the caller-supplied idempotency key; a duplicate key returns the original result rather than re-submitting.
+- Errors carry a correlation id (request id) and the stable error codes above so ops can trace a failed orchestration without exposing secrets or raw key material.
+
+Rollback:
+- Set `FEATURE_MAINNET_PAYMENT_SUBMIT=false` (or unset) to immediately stop all mainnet orchestration spends; testnet flows continue to work. No migration or redeploy of wallet state is required.
