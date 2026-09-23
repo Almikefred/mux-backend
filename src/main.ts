@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 import { Logger } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe } from '@nestjs/common';
@@ -27,6 +28,8 @@ async function bootstrap() {
 
   const app = await NestFactory.create(AppModule, { bodyParser: false });
 
+  // Apply the configurable JSON body size limit. Oversized payloads are
+  // rejected with a stable 413 error envelope (code + correlation id).
   configureBodySizeLimit(app, env.JSON_BODY_LIMIT_BYTES);
 
   // Configure CORS with credentials support
@@ -75,3 +78,5 @@ async function bootstrap() {
 }
 
 bootstrap();
+=======
+>>>>>>> upstream/staging
