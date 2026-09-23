@@ -3,6 +3,8 @@ import {
   Injectable,
   NotFoundException,
   BadRequestException,
+  ConflictException,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { EventEmitter2 } from '@nestjs/event-emitter';
@@ -36,6 +38,20 @@ const ALLOWED_TRANSITIONS: Record<string, PaymentStatus[]> = {
   [PaymentStatus.CONFIRMED]: [],
   [PaymentStatus.FAILED]: [],
 };
+
+// Stable, typed error codes for the payment write path. Clients can branch on
+// these without parsing human-readable messages.
+export const PaymentErrorCode = {
+  IDEMPOTENCY_CONFLICT: 'PAYMENT_IDEMPOTENCY_CONFLICT',
+  IDEMPOTENCY_IN_PROGRESS: 'PAYMENT_IDEMPOTENCY_IN_PROGRESS',
+  DEPENDENCY_UNAVAILABLE: 'PAYMENT_DEPENDENCY_UNAVAILABLE',
+} as const;
+
+export type PaymentErrorCode =
+  (typeof PaymentErrorCode)[keyof typeof PaymentErrorCode];
+
+// Prisma unique-constraint violation code.
+const PRISMA_UNIQUE_VIOLATION = 'P2002';
 
 @Injectable()
 export class PaymentsService {
@@ -161,6 +177,56 @@ export class PaymentsService {
 
       return payment;
     } catch (err) {
+      // Concurrent/replayed request raced past the pre-check and lost the
+      // unique-constraint race on idempotencyKey. Return the original result
+      // so the write path is exactly-once instead of surfacing a 500.
+      if (
+        idempotencyKey &&
+        err?.code === PRISMA_UNIQUE_VIOLATION &&
+        this.isIdempotencyKeyViolation(err)
+      ) {
+        const existing = await this.prisma.payment.findUnique({
+          where: { idempotencyKey },
+        });
+        if (existing) {
+          this.logger.logWithContext(
+            'Idempotency conflict resolved to existing payment',
+            {
+              requestId,
+              clientVersion,
+              entityId: existing.id.toString(),
+              entityType: 'payment',
+              operation: 'create',
+              outcome: 'idempotent',
+            },
+          );
+          this.metrics.incrementPaymentIdempotencyHit();
+          this.paymentMetrics.record({
+            operation: 'create',
+            outcome: 'idempotent',
+            durationMs: Date.now() - start,
+            currency,
+          });
+          return existing;
+        }
+        // The conflicting row is not visible yet (in-flight transaction).
+        // Fail closed with a stable, retryable error code.
+        this.metrics.incrementPaymentIdempotencyConflict();
+        this.paymentMetrics.record({
+          operation: 'create',
+          outcome: 'conflict',
+          durationMs: Date.now() - start,
+          currency,
+          failureReason: PaymentErrorCode.IDEMPOTENCY_IN_PROGRESS,
+        });
+        throw new ConflictException({
+          code: PaymentErrorCode.IDEMPOTENCY_IN_PROGRESS,
+          message:
+            'A payment with this idempotency key is already being processed',
+          requestId,
+        });
+      }
+
       this.paymentMetrics.record({
         operation: 'create',
         outcome: 'failure',
@@ -170,6 +236,26 @@ export class PaymentsService {
       });
       throw err;
     }
+  }
+
+  /**
+   * Detect whether a Prisma P2002 violation was caused by the idempotencyKey
+   * unique constraint (as opposed to some other unique field).
+   */
+  private isIdempotencyKeyViolation(err: any): boolean {
+    const target = err?.meta?.target;
+    if (Array.isArray(target)) {
+      return target.includes('idempotencyKey');
+    }
+    if (typeof target === 'string') {
+      return target.includes('idempotencyKey');
+    }
+    // If the driver did not report the target, treat it as an idempotency
+    // conflict only when the message references the key; otherwise let the
+    // original error propagate.
+    return typeof err?.message === 'string'
+      ? err.message.includes('idempotencyKey')
+      : false;
   }
 
   async createBatch(dto: BatchPaymentDto) {
@@ -186,11 +272,9 @@ export class PaymentsService {
   ): Promise<void> {
     const { walletId, receiverWalletId, fromId, toId, amount } =
       createPaymentDto;
-    const senderWallet = await retryWithBackoff(
+    const senderWallet = await this.wrapDependency(
       () => this.walletsService.findWalletById(walletId),
-      3,
-      100,
-      this.logger,
+      'wallets.findWalletById',
     );
     if (senderWallet.status !== WalletStatus.ACTIVE) {
       throw new BadRequestException(
@@ -206,18 +290,43 @@ export class PaymentsService {
       throw new BadRequestException('Payments to self are not allowed');
     }
 
-    await retryWithBackoff(
+    await this.wrapDependency(
       () => this.walletsService.findWalletById(receiverWalletId),
-      3,
-      100,
-      this.logger,
+      'wallets.findWalletById',
     );
-    await retryWithBackoff(
+    await this.wrapDependency(
       () => this.paymentLimitsPort.checkLimits(walletId, amount),
-      3,
-      100,
-      this.logger,
+      'paymentLimits.checkLimits',
     );
+  }
+
+  /**
+   * Fail closed on writes when a dependency (RPC/DB/Horizon) is unavailable.
+   * Retries with backoff, then surfaces a stable, typed error code and the
+   * correlation id so callers can retry safely without leaking internals.
+   */
+  private async wrapDependency<T>(
+    fn: () => Promise<T>,
+    dependency: string,
+  ): Promise<T> {
+    try {
+      return await retryWithBackoff(fn, 3, 100, this.logger);
+    } catch (err) {
+      const requestId = this.requestContext.getRequestId();
+      this.logger.errorWithContext('Payment dependency unavailable', {
+        requestId,
+        operation: 'create',
+        outcome: 'failure',
+        dependency,
+        failureReason: err?.constructor?.name ?? 'unknown',
+      });
+      this.metrics.incrementPaymentDependencyFailure();
+      throw new ServiceUnavailableException({
+        code: PaymentErrorCode.DEPENDENCY_UNAVAILABLE,
+        message: 'Payment dependency unavailable, please retry',
+        requestId,
+      });
+    }
   }
 
   async findAll(
@@ -257,75 +366,6 @@ export class PaymentsService {
   async update(id: string, updatePaymentDto: UpdatePaymentDto) {
     const requestId = this.requestContext.getRequestId();
     const clientVersion = this.requestContext.getClientVersion();
-    const paymentId = parseInt(id, 10);
+    const paymentId 
 
-    this.logger.logWithContext('Updating payment', {
-      requestId,
-      clientVersion,
-      entityId: paymentId.toString(),
-      entityType: 'payment',
-      operation: 'update',
-    });
-
-    const payment = await this.prisma.payment.findUnique({
-      where: { id: paymentId },
-    });
-    if (!payment) {
-      throw new NotFoundException(`Payment #${paymentId} not found`);
-    }
-
-    if (updatePaymentDto.status !== undefined) {
-      const allowed = ALLOWED_TRANSITIONS[payment.status] ?? [];
-      if (!allowed.includes(updatePaymentDto.status)) {
-        throw new BadRequestException(
-          `Cannot transition payment from ${payment.status} to ${updatePaymentDto.status}`,
-        );
-      }
-    }
-
-    const updatedPayment = await this.prisma.payment.update({
-      where: { id: paymentId },
-      data: updatePaymentDto,
-    });
-
-    // Record status change in history table (best-effort, non-blocking)
-    if (updatePaymentDto.status !== undefined) {
-      void this.statusHistory.recordStatusChange({
-        paymentId: payment.id,
-        fromStatus: payment.status,
-        toStatus: updatePaymentDto.status,
-        changedBy: 'api',
-        metadata: { requestId },
-      });
-    }
-
-    if (updatePaymentDto.status === PaymentStatus.CONFIRMED) {
-      this.eventEmitter.emit(
-        'payment.completed',
-        new PaymentCompletedEvent(
-          updatedPayment.id,
-          updatedPayment.amount,
-          updatedPayment.currency,
-          updatedPayment.userId,
-        ),
-      );
-    } else if (updatePaymentDto.status === PaymentStatus.FAILED) {
-      this.metrics.incrementPaymentsFailed('user_action');
-      this.eventEmitter.emit(
-        'payment.failed',
-        new PaymentFailedEvent(
-          updatedPayment.id,
-          updatedPayment.amount,
-          updatedPayment.currency,
-          updatedPayment.userId,
-        ),
-      );
-    }
-
-    return updatedPayment;
-  }
-
-  remove(id: string) {
-    return `This action removes payment ${id}`;
-  }
-}
+/* … truncated 2017 chars — edit only what you need near the top … */
