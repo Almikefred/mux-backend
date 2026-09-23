@@ -1,13 +1,68 @@
-# Mainnet Payment Submit Feature Flag
+# Mainnet Payment Feature Flag & Kill-Switch
 
-- `FEATURE_MAINNET_PAYMENT_SUBMIT` (boolean, default: false)
-  - When `true`, `POST /transactions/fee-bump` requests with `network: "MAINNET"` are submitted to Horizon mainnet as normal.
-  - When `false` or unset, MAINNET submissions are rejected with HTTP 403 (Forbidden) and message: "Mainnet payment submission is not available at this time. (Flag: mainnet_payment_submit)". `TESTNET` submissions are unaffected — the flag is only consulted when `network === "MAINNET"`.
+This runbook documents the feature flag and kill-switch that gate all
+mainnet-affecting payment behavior in `mux-backend`, including the
+**payment dry-run mode** described in [`PAYMENT-DRY-RUN.md`](./PAYMENT-DRY-RUN.md).
 
-Notes:
-- Implemented as a kill-switch check inside `FeeBumpService.submitFeeBump` (not the route-level `FeatureFlagGuard`), because the decision depends on the `network` field in the request body rather than being fixed per-route.
-- Reuses the existing `FeatureFlagService.isEnabled()` helper and the `FEATURE_<FLAG_NAME>` env var convention (e.g. `FEATURE_MAINNET_PAYMENT_SUBMIT=true`).
-- Rejections happen before any wallet key material is decrypted or any call to Horizon is made.
+> Scope: money-path and mainnet-affecting changes only. Testnet behavior is
+> unaffected unless explicitly noted.
 
-Operational guidance:
-- Keep this flag off in production until mainnet payment submission has been reviewed and approved for general availability; flip it on per-environment via env/secret config.
+## Why this exists
+
+Payment dry-run lets clients simulate and validate a payment without
+submitting it to Stellar/Horizon. Because dry-run shares the same authz,
+idempotency, and validation code paths as live payments, it must be gated so
+that a misconfiguration cannot accidentally promote a dry-run into a live
+spend, and so operators can disable the money path quickly during an incident.
+
+## Flags
+
+| Flag | Env var | Default | Effect |
+| --- | --- | --- | --- |
+| Payment dry-run | `PAYMENT_DRY_RUN_ENABLED` | `false` | Enables the dry-run entrypoint. When `false`, dry-run requests are rejected with `PAYMENT_DRY_RUN_DISABLED`. |
+| Mainnet payments | `PAYMENT_MAINNET_ENABLED` | `false` | Master switch for live mainnet submission. When `false`, live writes fail closed with `PAYMENT_MAINNET_DISABLED`. |
+| Payment kill-switch | `PAYMENT_KILL_SWITCH` | `false` | When `true`, all payment writes (live and dry-run) are rejected immediately with `PAYMENT_KILL_SWITCH_ENGAGED`. |
+
+All flags are **deny-by-default**: unset or unparseable values are treated as
+`false`.
+
+## Invariants
+
+1. Dry-run **never** submits to Stellar/Horizon. It only validates and returns
+   a simulated result.
+2. Dry-run and live payments share the same authz checks (owner / delegate /
+   guardian / API-key / JWT). Dry-run cannot be used to bypass payment policy.
+3. Every dry-run request carries a correlation id and is idempotent on
+   `(account, idempotencyKey)`; replays return the original result.
+4. On RPC/DB/Horizon outage, writes fail closed. Dry-run may return a
+   validation error but must not mutate state.
+5. No secrets (keys, JWTs, webhook secrets) are logged; only redacted
+   identifiers and correlation ids.
+
+## Kill-switch procedure
+
+1. Set `PAYMENT_KILL_SWITCH=true` and roll the deployment.
+2. Confirm rejection metrics: `payments_rejected_total{reason="kill_switch"}`
+   increases and `payments_submitted_total` drops to zero.
+3. Investigate using correlation ids from structured logs.
+4. To restore, set `PAYMENT_KILL_SWITCH=false` and roll back.
+
+## Rollback
+
+- Disable dry-run: `PAYMENT_DRY_RUN_ENABLED=false`.
+- Disable live mainnet: `PAYMENT_MAINNET_ENABLED=false`.
+- Full stop: `PAYMENT_KILL_SWITCH=true`.
+
+Each flag is independently reversible without a schema migration.
+
+## Observability
+
+- `payments_dry_run_total{result}` — dry-run outcomes.
+- `payments_rejected_total{reason}` — authz/flag/idempotency rejections.
+- `payments_submitted_total` — live submissions (must be 0 when gated).
+- Structured logs include `correlationId` and redacted account refs only.
+
+## References
+
+- [`PAYMENT-DRY-RUN.md`](./PAYMENT-DRY-RUN.md)
+- [`SECURITY.md`](../SECURITY.md)
