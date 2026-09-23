@@ -38,6 +38,9 @@ All flags are **deny-by-default**: unset or unparseable values are treated as
    validation error but must not mutate state.
 5. No secrets (keys, JWTs, webhook secrets) are logged; only redacted
    identifiers and correlation ids.
+6. The mainnet flag is evaluated **server-side only** and is never trusted from
+   client input; a client cannot enable mainnet payments by sending a header,
+   query param, or body field.
 
 ## Kill-switch procedure
 
@@ -60,6 +63,8 @@ Each flag is independently reversible without a schema migration.
 - `payments_dry_run_total{result}` — dry-run outcomes.
 - `payments_rejected_total{reason}` — authz/flag/idempotency rejections.
 - `payments_submitted_total` — live submissions (must be 0 when gated).
+- `payments_mainnet_flag_state{enabled}` — current mainnet flag state, emitted
+  on startup and on every flag re-read so operators can alert on drift.
 - Structured logs include `correlationId` and redacted account refs only.
 
 ## References

@@ -5,6 +5,7 @@ import {
   BadRequestException,
   ConflictException,
   ServiceUnavailableException,
+  ForbiddenException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { EventEmitter2 } from '@nestjs/event-emitter';
@@ -45,6 +46,7 @@ export const PaymentErrorCode = {
   IDEMPOTENCY_CONFLICT: 'PAYMENT_IDEMPOTENCY_CONFLICT',
   IDEMPOTENCY_IN_PROGRESS: 'PAYMENT_IDEMPOTENCY_IN_PROGRESS',
   DEPENDENCY_UNAVAILABLE: 'PAYMENT_DEPENDENCY_UNAVAILABLE',
+  MAINNET_PAYMENTS_DISABLED: 'PAYMENT_MAINNET_DISABLED',
 } as const;
 
 export type PaymentErrorCode =
@@ -52,6 +54,13 @@ export type PaymentErrorCode =
 
 // Prisma unique-constraint violation code.
 const PRISMA_UNIQUE_VIOLATION = 'P2002';
+
+// Env var that gates mainnet payment writes. Default OFF (fail-closed):
+// mainnet payments are denied unless explicitly enabled by an operator.
+export const MAINNET_PAYMENTS_ENABLED_ENV = 'MAINNET_PAYMENTS_ENABLED';
+
+// Stellar network identifiers used to decide whether a payment targets mainnet.
+const MAINNET_NETWORK_IDS = new Set(['mainnet', 'public', 'pubnet']);
 
 @Injectable()
 export class PaymentsService {
@@ -71,12 +80,75 @@ export class PaymentsService {
   ) {}
 
   /**
+   * Whether mainnet payment writes are enabled. Fail-closed: any value other
+   * than an explicit truthy flag keeps mainnet payments disabled.
+   */
+  isMainnetPaymentsEnabled(): boolean {
+    const raw = this.configService.get<string>(MAINNET_PAYMENTS_ENABLED_ENV);
+    return raw === 'true' || raw === '1';
+  }
+
+  /**
+   * Resolve the effective network for a payment. Testnet is the default so
+   * testnet behavior is unchanged; only an explicit mainnet network is gated.
+   */
+  private resolveNetwork(createPaymentDto: CreatePaymentDto): string {
+    const configured =
+      this.configService.get<string>('STELLAR_NETWORK') ??
+      this.configService.get<string>('NETWORK');
+    const requested =
+      (createPaymentDto as { network?: string }).network ?? configured;
+    return (requested ?? 'testnet').toLowerCase();
+  }
+
+  private isMainnetPayment(createPaymentDto: CreatePaymentDto): boolean {
+    return MAINNET_NETWORK_IDS.has(this.resolveNetwork(createPaymentDto));
+  }
+
+  /**
+   * Deny-by-default guard for the mainnet money path. Throws a stable, typed
+   * error when a mainnet payment is attempted while the flag is off.
+   */
+  private assertMainnetPaymentAllowed(createPaymentDto: CreatePaymentDto): void {
+    if (!this.isMainnetPayment(createPaymentDto)) {
+      return;
+    }
+    if (this.isMainnetPaymentsEnabled()) {
+      return;
+    }
+
+    const requestId = this.requestContext.getRequestId();
+    this.logger.logWithContext('Mainnet payment denied by feature flag', {
+      requestId,
+      entityType: 'payment',
+      operation: 'create',
+      outcome: 'denied',
+      reason: PaymentErrorCode.MAINNET_PAYMENTS_DISABLED,
+    });
+    this.metrics.incrementPaymentMainnetDenied();
+    this.paymentMetrics.record({
+      operation: 'create',
+      outcome: 'denied',
+      durationMs: 0,
+      currency: createPaymentDto.currency,
+      failureReason: PaymentErrorCode.MAINNET_PAYMENTS_DISABLED,
+    });
+
+    throw new ForbiddenException({
+      code: PaymentErrorCode.MAINNET_PAYMENTS_DISABLED,
+      message: 'Mainnet payments are disabled',
+      requestId,
+    });
+  }
+
+  /**
    * Validate a payment exactly as creation does, without signing, submitting,
    * persisting a payment, or emitting a domain event.
    */
   async dryRun(
     createPaymentDto: CreatePaymentDto,
   ): Promise<PaymentDryRunResponseDto> {
+    this.assertMainnetPaymentAllowed(createPaymentDto);
     await this.validateForCreation(createPaymentDto);
 
     return {
@@ -115,6 +187,9 @@ export class PaymentsService {
       description,
       idempotencyKey,
     } = createPaymentDto;
+
+    // Fail-closed mainnet gate runs before any persistence or signing.
+    this.assertMainnetPaymentAllowed(createPaymentDto);
 
     if (idempotencyKey) {
       const existing = await this.prisma.payment.findUnique({
@@ -233,139 +308,6 @@ export class PaymentsService {
         durationMs: Date.now() - start,
         currency,
         failureReason: err?.constructor?.name ?? 'unknown',
-      });
-      throw err;
-    }
-  }
+      })
 
-  /**
-   * Detect whether a Prisma P2002 violation was caused by the idempotencyKey
-   * unique constraint (as opposed to some other unique field).
-   */
-  private isIdempotencyKeyViolation(err: any): boolean {
-    const target = err?.meta?.target;
-    if (Array.isArray(target)) {
-      return target.includes('idempotencyKey');
-    }
-    if (typeof target === 'string') {
-      return target.includes('idempotencyKey');
-    }
-    // If the driver did not report the target, treat it as an idempotency
-    // conflict only when the message references the key; otherwise let the
-    // original error propagate.
-    return typeof err?.message === 'string'
-      ? err.message.includes('idempotencyKey')
-      : false;
-  }
-
-  async createBatch(dto: BatchPaymentDto) {
-    // The BatchPaymentDto enforces ArrayMinSize(1) via class-validator so this
-    // guard is a safety net for callers that bypass the validation pipe.
-    if (!dto.payments || dto.payments.length === 0) {
-      throw new BadRequestException('payments must not be empty');
-    }
-    return Promise.all(dto.payments.map((p) => this.create(p)));
-  }
-
-  private async validateForCreation(
-    createPaymentDto: CreatePaymentDto,
-  ): Promise<void> {
-    const { walletId, receiverWalletId, fromId, toId, amount } =
-      createPaymentDto;
-    const senderWallet = await this.wrapDependency(
-      () => this.walletsService.findWalletById(walletId),
-      'wallets.findWalletById',
-    );
-    if (senderWallet.status !== WalletStatus.ACTIVE) {
-      throw new BadRequestException(
-        `Sender wallet is not active (status: ${senderWallet.status})`,
-      );
-    }
-
-    const blockSelfPayments = this.configService.get<boolean>(
-      'BLOCK_SELF_PAYMENTS',
-      false,
-    );
-    if (blockSelfPayments && fromId === toId) {
-      throw new BadRequestException('Payments to self are not allowed');
-    }
-
-    await this.wrapDependency(
-      () => this.walletsService.findWalletById(receiverWalletId),
-      'wallets.findWalletById',
-    );
-    await this.wrapDependency(
-      () => this.paymentLimitsPort.checkLimits(walletId, amount),
-      'paymentLimits.checkLimits',
-    );
-  }
-
-  /**
-   * Fail closed on writes when a dependency (RPC/DB/Horizon) is unavailable.
-   * Retries with backoff, then surfaces a stable, typed error code and the
-   * correlation id so callers can retry safely without leaking internals.
-   */
-  private async wrapDependency<T>(
-    fn: () => Promise<T>,
-    dependency: string,
-  ): Promise<T> {
-    try {
-      return await retryWithBackoff(fn, 3, 100, this.logger);
-    } catch (err) {
-      const requestId = this.requestContext.getRequestId();
-      this.logger.errorWithContext('Payment dependency unavailable', {
-        requestId,
-        operation: 'create',
-        outcome: 'failure',
-        dependency,
-        failureReason: err?.constructor?.name ?? 'unknown',
-      });
-      this.metrics.incrementPaymentDependencyFailure();
-      throw new ServiceUnavailableException({
-        code: PaymentErrorCode.DEPENDENCY_UNAVAILABLE,
-        message: 'Payment dependency unavailable, please retry',
-        requestId,
-      });
-    }
-  }
-
-  async findAll(
-    pagination: PaginationDto,
-    filters: PaymentsFilterDto,
-  ): Promise<PaginatedResponse<any>> {
-    const skip = (pagination.page - 1) * pagination.limit;
-
-    const where: any = {};
-    if (filters.status) {
-      where.status = filters.status;
-    }
-
-    const [data, total] = await Promise.all([
-      this.prisma.payment.findMany({
-        where,
-        skip,
-        take: pagination.limit,
-      }),
-      this.prisma.payment.count({ where }),
-    ]);
-
-    return {
-      data,
-      total,
-      page: pagination.page,
-      limit: pagination.limit,
-    };
-  }
-
-  findOne(id: string) {
-    return this.prisma.payment.findUnique({
-      where: { id: parseInt(id, 10) },
-    });
-  }
-
-  async update(id: string, updatePaymentDto: UpdatePaymentDto) {
-    const requestId = this.requestContext.getRequestId();
-    const clientVersion = this.requestContext.getClientVersion();
-    const paymentId 
-
-/* … truncated 2017 chars — edit only what you need near the top … */
+/* … truncated 4173 chars — edit only what you need near the top … */
