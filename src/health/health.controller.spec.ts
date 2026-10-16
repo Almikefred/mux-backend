@@ -23,6 +23,7 @@ describe('HealthController', () => {
       const result = controller.health();
 
       expect(result.status).toBe('ok');
+      expect(result).toHaveProperty('build');
       expect(prisma.$queryRaw).not.toHaveBeenCalled();
     });
   });
